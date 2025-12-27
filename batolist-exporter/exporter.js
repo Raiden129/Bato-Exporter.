@@ -1,6 +1,9 @@
 (() => {
     // --- SITE DETECTION ---
     const isMangaPark = window.location.hostname.includes('mangapark');
+    const isHistoryPage = window.location.pathname === '/my/history';
+    const isListPage = window.location.pathname.includes('/batolists') || window.location.pathname.includes('/mplists');
+    
     const SITE_CONFIG = isMangaPark ? {
         name: 'MangaPark',
         apiEndpoint: '/apo/',
@@ -20,7 +23,8 @@
     // --- CONFIGURATION ---
     const API_ENDPOINT = SITE_CONFIG.apiEndpoint;
     const COMIC_FETCH_LIMIT = 5000; 
-    const HISTORY_FETCH_LIMIT = 300; 
+    const HISTORY_FETCH_LIMIT = 300;
+    const HISTORY_EXPORT_LIMIT = 100; // Items per page for full history export
 
     // --- GRAPHQL QUERIES ---
     const LIST_QUERY = `
@@ -72,6 +76,104 @@
             }
         }
     }`;
+
+    // Full history query with complete comic data for history page export
+    // Note: Bato uses chapterNodes_last, MangaPark uses last_chapterNodes
+    const HISTORY_FULL_QUERY_BATO = `
+    query get_sser_myHistory($select: Sser_MyHistory_Select) {
+        get_sser_myHistory(select: $select) {
+            reqLimit
+            newStart
+            items {
+                date
+                comicNode {
+                    id
+                    data {
+                        id
+                        name
+                        urlPath
+                        urlCover600
+                        genres
+                        authors
+                        artists
+                        score_avg
+                        uploadStatus
+                        originalStatus
+                        origLang
+                        dateUpdate
+                        dateModify
+                        chaps_normal
+                        chapterNodes_last(amount: 1) {
+                            id
+                            data {
+                                dname
+                                title
+                                serial
+                            }
+                        }
+                    }
+                }
+                chapterNode {
+                    id
+                    data {
+                        dname
+                        title
+                        serial
+                        urlPath
+                    }
+                }
+            }
+        }
+    }`;
+
+    const HISTORY_FULL_QUERY_MANGAPARK = `
+    query get_sser_myHistory($select: Sser_MyHistory_Select) {
+        get_sser_myHistory(select: $select) {
+            reqLimit
+            newStart
+            items {
+                date
+                comicNode {
+                    id
+                    data {
+                        id
+                        name
+                        urlPath
+                        urlCover600
+                        genres
+                        authors
+                        artists
+                        score_avg
+                        uploadStatus
+                        originalStatus
+                        origLang
+                        dateUpdate
+                        dateModify
+                        chaps_normal
+                        last_chapterNodes(amount: 1) {
+                            id
+                            data {
+                                dname
+                                title
+                                serial
+                            }
+                        }
+                    }
+                }
+                chapterNode {
+                    id
+                    data {
+                        dname
+                        title
+                        serial
+                        urlPath
+                    }
+                }
+            }
+        }
+    }`;
+
+    const HISTORY_FULL_QUERY = isMangaPark ? HISTORY_FULL_QUERY_MANGAPARK : HISTORY_FULL_QUERY_BATO;
 
     // --- UTILITIES ---
     function getUserId() {
@@ -173,6 +275,32 @@
         const workers = Array(CONCURRENCY).fill(null).map(() => worker());
         await Promise.all(workers);
     }
+
+    // Process covers for history items (flat array)
+    async function processHistoryCovers(items, updateStatusFn) {
+        const queue = items.filter(item => item.urlCover600);
+        const total = queue.length;
+        let processed = 0;
+        const CONCURRENCY = 5;
+
+        updateStatusFn(`Downloading covers: 0/${total}`);
+
+        async function worker() {
+            while (queue.length > 0) {
+                const item = queue.shift();
+                const absUrl = window.location.origin + item.urlCover600;
+                item.base64Cover = await fetchImageAsBase64(absUrl);
+                processed++;
+                if (processed % 5 === 0 || processed === total) {
+                    updateStatusFn(`Downloading covers: ${processed}/${total}`);
+                }
+            }
+        }
+
+        const workers = Array(CONCURRENCY).fill(null).map(() => worker());
+        await Promise.all(workers);
+    }
+
 
     // --- FORMAT 1: HTML (Web / Visual) ---
     function generateHTML(lists, username, date, editable = false) {
@@ -391,7 +519,7 @@ ${editable ? `<div class="action-bar">
                 
                 let historyHtml = '<span class="chap-val">-</span>';
                 if (c.history) {
-                    historyHtml = `<span class="chap-val" style="color:#facc15"> ${c.history.chapterName}</span><span class="chap-date">${timeAgo(c.history.readDate)}</span>`;
+                    historyHtml = `<span class="chap-val" style="color:#facc15"> ${c.history.chapterName}</span><span class="chap-date">${timeAgo(c.history.readDate)}</span>`;
                 }
 
                 const imgSrc = c.base64Cover; // Only use embedded covers, not URLs
@@ -412,7 +540,24 @@ ${editable ? `<div class="action-bar">
         
         html += `
     <div class="no-results" id="noResults" style="display:none;">No comics match your filters</div>
-</div>
+</div>`;
+
+        // Add filter script
+        html += generateFilterScript();
+        
+        // Add editable script if needed
+        if (editable) {
+            html += generateEditableScript(lists);
+        }
+        
+        html += `</body></html>`;
+        return html;
+    }
+
+
+    // Generate filter script for HTML export
+    function generateFilterScript() {
+        return `
 <script>
 (function() {
     var searchInput = document.getElementById('searchInput');
@@ -442,31 +587,20 @@ ${editable ? `<div class="action-bar">
             var visibleInList = 0;
             var listMatch = !listVal || listName === listVal;
             
-            // Sort items if sort option selected
             if (sortVal) {
                 items.sort(function(a, b) {
                     switch(sortVal) {
-                        case 'title':
-                            return a.dataset.title.localeCompare(b.dataset.title);
-                        case 'title-desc':
-                            return b.dataset.title.localeCompare(a.dataset.title);
-                        case 'score':
-                            return parseFloat(b.dataset.score || 0) - parseFloat(a.dataset.score || 0);
-                        case 'chapters':
-                            return parseInt(b.dataset.chapters || 0) - parseInt(a.dataset.chapters || 0);
-                        case 'lastread':
-                            return parseInt(b.dataset.lastread || 0) - parseInt(a.dataset.lastread || 0);
-                        case 'updated':
-                            return parseInt(b.dataset.updated || 0) - parseInt(a.dataset.updated || 0);
-                        default:
-                            return 0;
+                        case 'title': return a.dataset.title.localeCompare(b.dataset.title);
+                        case 'title-desc': return b.dataset.title.localeCompare(a.dataset.title);
+                        case 'score': return parseFloat(b.dataset.score || 0) - parseFloat(a.dataset.score || 0);
+                        case 'chapters': return parseInt(b.dataset.chapters || 0) - parseInt(a.dataset.chapters || 0);
+                        case 'lastread': return parseInt(b.dataset.lastread || 0) - parseInt(a.dataset.lastread || 0);
+                        case 'updated': return parseInt(b.dataset.updated || 0) - parseInt(a.dataset.updated || 0);
+                        default: return 0;
                     }
                 });
-                // Re-append items in sorted order
                 var parent = items[0] ? items[0].parentNode : null;
-                if (parent) {
-                    items.forEach(function(item) { parent.appendChild(item); });
-                }
+                if (parent) { items.forEach(function(item) { parent.appendChild(item); }); }
             }
             
             items.forEach(function(item) {
@@ -493,11 +627,8 @@ ${editable ? `<div class="action-bar">
             var countEl = block.querySelector('.list-count');
             if (countEl) countEl.textContent = visibleInList;
             
-            if (visibleInList === 0 || !listMatch) {
-                block.classList.add('hidden');
-            } else {
-                block.classList.remove('hidden');
-            }
+            if (visibleInList === 0 || !listMatch) { block.classList.add('hidden'); }
+            else { block.classList.remove('hidden'); }
         });
         
         var hasFilters = search || listVal || statusVal || langVal || tagVal || sortVal;
@@ -522,29 +653,35 @@ ${editable ? `<div class="action-bar">
         applyFilters();
     });
 })();
-</script>
-${editable ? `
-<script id="listData" type="application/json">${JSON.stringify(lists.map(list => ({
-    name: list.data.name,
-    isPublic: list.data.isPublic,
-    items: (list.data.comicNodes || []).map(node => {
-        const c = node.data;
-        return {
-            id: c.id || Math.random().toString(36).substr(2, 9),
-            title: c.name,
-            score: c.score_avg || 0,
-            status: c.uploadStatus || c.originalStatus || 'ongoing',
-            lang: c.origLang || 'ko',
-            chapters: c.chaps_normal || 0,
-            authors: (c.authors || []).join(', '),
-            tags: (c.genres || []).join(', '),
-            lastRead: c.history ? c.history.chapterName : '',
-            lastReadDate: c.history ? c.history.readDate : 0,
-            dateUpdate: c.dateUpdate || c.dateModify || 0,
-            cover: c.base64Cover || ''
-        };
-    })
-})))}</script>
+</script>`;
+    }
+
+    // Generate editable script for HTML export
+    function generateEditableScript(lists) {
+        const dataJson = JSON.stringify(lists.map(list => ({
+            name: list.data.name,
+            isPublic: list.data.isPublic,
+            items: (list.data.comicNodes || []).map(node => {
+                const c = node.data;
+                return {
+                    id: c.id || Math.random().toString(36).substr(2, 9),
+                    title: c.name,
+                    score: c.score_avg || 0,
+                    status: c.uploadStatus || c.originalStatus || 'ongoing',
+                    lang: c.origLang || 'ko',
+                    chapters: c.chaps_normal || 0,
+                    authors: (c.authors || []).join(', '),
+                    tags: (c.genres || []).join(', '),
+                    lastRead: c.history ? c.history.chapterName : '',
+                    lastReadDate: c.history ? c.history.readDate : 0,
+                    dateUpdate: c.dateUpdate || c.dateModify || 0,
+                    cover: c.base64Cover || ''
+                };
+            })
+        })));
+
+        return `
+<script id="listData" type="application/json">${dataJson}</script>
 <div class="modal-overlay" id="editModal">
     <div class="modal-box">
         <div class="modal-title" id="modalTitle">Add New Entry</div>
@@ -638,7 +775,6 @@ ${editable ? `
     var coverPreviewImg = document.getElementById('coverPreviewImg');
     var formCoverData = document.getElementById('formCoverData');
     
-    // Cover upload handlers
     uploadCoverBtn.addEventListener('click', function() { formCover.click(); });
     formCover.addEventListener('change', function(e) {
         var file = e.target.files[0];
@@ -659,7 +795,6 @@ ${editable ? `
         coverPreviewImg.style.display = 'none';
     });
     
-    // Populate list dropdown from DATA
     var formList = document.getElementById('formList');
     DATA.forEach(function(list, idx) {
         var opt = document.createElement('option');
@@ -704,7 +839,10 @@ ${editable ? `
                 var details = item.querySelector('.details');
                 coverBox = document.createElement('div');
                 coverBox.className = 'cover-box';
-                coverBox.innerHTML = '<img class="cover-img" src="" loading="lazy">';
+                var img = document.createElement('img');
+                img.className = 'cover-img';
+                img.loading = 'lazy';
+                coverBox.appendChild(img);
                 item.insertBefore(coverBox, details);
             }
             coverBox.querySelector('.cover-img').src = data.cover;
@@ -728,11 +866,24 @@ ${editable ? `
                 else if (demographicTags.indexOf(tLower) !== -1) cls = 'tag tag-primary';
                 html += '<span class="' + cls + '">' + t.trim() + '</span>';
             });
-            tagsRow.innerHTML = html;
+            tagsRow.textContent = '';
+            var parser = new DOMParser();
+            var tagDoc = parser.parseFromString('<div>' + html + '</div>', 'text/html');
+            var tagNodes = tagDoc.body.firstChild.childNodes;
+            while (tagNodes.length) tagsRow.appendChild(tagNodes[0]);
         }
         var historyBox = item.querySelector('.history-box');
         if (historyBox) {
-            historyBox.innerHTML = '<span class="chap-label">Last Read</span><span class="chap-val" style="color:#facc15">' + (data.lastRead || '-') + '</span>';
+            historyBox.textContent = '';
+            var label = document.createElement('span');
+            label.className = 'chap-label';
+            label.textContent = 'Last Read';
+            var val = document.createElement('span');
+            val.className = 'chap-val';
+            val.style.color = '#facc15';
+            val.textContent = data.lastRead || '-';
+            historyBox.appendChild(label);
+            historyBox.appendChild(val);
         }
     }
     
@@ -744,7 +895,22 @@ ${editable ? `
             listBlock = document.createElement('div');
             listBlock.className = 'list-block';
             listBlock.dataset.list = listName;
-            listBlock.innerHTML = '<div class="list-head"><span class="list-name">' + listName + '</span><span class="list-meta">Custom <span class="list-count">0</span> items</span></div>';
+            var listHead = document.createElement('div');
+            listHead.className = 'list-head';
+            var nameSpan = document.createElement('span');
+            nameSpan.className = 'list-name';
+            nameSpan.textContent = listName;
+            var metaSpan = document.createElement('span');
+            metaSpan.className = 'list-meta';
+            metaSpan.textContent = 'Custom ';
+            var countSpan = document.createElement('span');
+            countSpan.className = 'list-count';
+            countSpan.textContent = '0';
+            metaSpan.appendChild(countSpan);
+            metaSpan.appendChild(document.createTextNode(' items'));
+            listHead.appendChild(nameSpan);
+            listHead.appendChild(metaSpan);
+            listBlock.appendChild(listHead);
             container.insertBefore(listBlock, noResults);
         }
         var langMap = { ko: 'Manhwa', ja: 'Manga', zh: 'Manhua', en: 'Comic' };
@@ -765,7 +931,9 @@ ${editable ? `
         var historyHtml = data.lastRead ? '<span class="chap-val" style="color:#facc15">' + data.lastRead + '</span>' : '<span class="chap-val">-</span>';
         var coverHtml = data.cover ? '<div class="cover-box"><img class="cover-img" src="' + data.cover + '" loading="lazy"></div>' : '';
         var itemHtml = '<div class="item" data-id="' + data.id + '" data-list="' + listName + '" data-title="' + data.title.toLowerCase() + '" data-authors="' + data.authors.toLowerCase() + '" data-status="' + data.status + '" data-lang="' + data.lang + '" data-tags="' + data.tags.toLowerCase() + '" data-score="' + (data.score || 0) + '" data-chapters="' + (data.chapters || 0) + '" data-lastread="' + (data.lastReadDate || 0) + '" data-updated="' + (data.dateUpdate || 0) + '">' + coverHtml + '<div class="details"><div class="comic-title">' + data.title + '</div><div class="stats-row"><span>★ <span class="star-val">' + (data.score || '-') + '</span></span><span class="' + statusClass + '">' + data.status + '</span></div><div class="meta-row"><span>' + data.authors + '</span></div><div class="tags-row">' + tagsHtml + '</div><div class="chapter-row"><div class="chap-info history-box"><span class="chap-label">Last Read</span>' + historyHtml + '</div><div class="chap-info"><span class="chap-label">Chapters</span><span class="chap-val">' + (data.chapters || '-') + '</span></div></div><div class="item-actions"><button class="edit-btn" data-id="' + data.id + '">Edit</button><button class="delete-btn" data-id="' + data.id + '">Delete</button></div></div></div>';
-        listBlock.insertAdjacentHTML('beforeend', itemHtml);
+        var itemParser = new DOMParser();
+        var itemDoc = itemParser.parseFromString(itemHtml, 'text/html');
+        listBlock.appendChild(itemDoc.body.firstChild);
     }
     
     function updateListCounts() {
@@ -798,18 +966,10 @@ ${editable ? `
         modal.classList.add('open');
     }
     
-    function closeModal() {
-        modal.classList.remove('open');
-    }
+    function closeModal() { modal.classList.remove('open'); }
     
-    // Event: Add button
-    if (addBtn) {
-        addBtn.addEventListener('click', function() {
-            openModal(false, {}, 0);
-        });
-    }
+    if (addBtn) { addBtn.addEventListener('click', function() { openModal(false, {}, 0); }); }
     
-    // Event: Edit buttons (delegated)
     document.addEventListener('click', function(e) {
         if (e.target.classList.contains('edit-btn')) {
             var found = findItemInData(e.target.dataset.id);
@@ -829,13 +989,9 @@ ${editable ? `
         }
     });
     
-    // Event: Modal cancel
     modalCancel.addEventListener('click', closeModal);
-    modal.addEventListener('click', function(e) {
-        if (e.target === modal) closeModal();
-    });
+    modal.addEventListener('click', function(e) { if (e.target === modal) closeModal(); });
     
-    // Event: Modal save
     modalSave.addEventListener('click', function() {
         var title = document.getElementById('formTitle').value.trim();
         if (!title) { alert('Title is required'); return; }
@@ -886,14 +1042,11 @@ ${editable ? `
         closeModal();
     });
     
-    // Event: Save changes (download updated HTML)
     if (saveBtn) {
         saveBtn.addEventListener('click', function() {
-            // Update data and reset UI state before cloning
             document.getElementById('listData').textContent = JSON.stringify(DATA);
             unsavedBadge.classList.remove('show');
             hasChanges = false;
-            // Generate and download
             var html = '<!DOCTYPE html>\\n' + document.documentElement.outerHTML;
             var blob = new Blob([html], { type: 'text/html' });
             var a = document.createElement('a');
@@ -903,7 +1056,6 @@ ${editable ? `
         });
     }
     
-    // Event: Export data as JSON
     if (exportJsonBtn) {
         exportJsonBtn.addEventListener('click', function() {
             var blob = new Blob([JSON.stringify(DATA, null, 2)], { type: 'application/json' });
@@ -914,31 +1066,262 @@ ${editable ? `
         });
     }
     
-    // Warn before leaving with unsaved changes
     window.addEventListener('beforeunload', function(e) {
-        if (hasChanges) {
-            e.preventDefault();
-            e.returnValue = '';
+        if (hasChanges) { e.preventDefault(); e.returnValue = ''; }
+    });
+})();
+</script>`;
+    }
+
+
+    // --- HISTORY HTML GENERATOR ---
+    function generateHistoryHTML(items, username, date) {
+        const allStatuses = new Set();
+        const allLangs = new Set();
+        const allTags = new Set();
+        
+        items.forEach(item => {
+            const status = item.uploadStatus || item.originalStatus;
+            if (status) allStatuses.add(status);
+            if (item.origLang) allLangs.add(item.origLang);
+            (item.genres || []).forEach(g => allTags.add(g.toLowerCase()));
+        });
+
+        const langOptions = [...allLangs].sort().map(l => {
+            const label = formatLang(l).replace(/[^\w\s]/g, '').trim();
+            return '<option value="' + l + '">' + label + '</option>';
+        }).join('');
+        
+        const tagOptions = [...allTags].sort().map(t => {
+            return '<option value="' + t + '">' + t + '</option>';
+        }).join('');
+
+        let html = `<!DOCTYPE html>
+<html lang="en" data-theme="mdark">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>${username}'s ${SITE_CONFIG.name} Reading History</title>
+<style>
+    :root { --b1: #161616; --b2: #1c1c1c; --b3: #252525; --bc: #eee; --pc: #fff; --p: #00bcd4; --er: #f87171; --su: #4ade80; --wa: #facc15; }
+    * { box-sizing: border-box; }
+    body { background-color: var(--b1); color: var(--bc); font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Oxygen, Ubuntu, sans-serif; margin: 0; padding: 20px; font-size: 14px; line-height: 1.5; }
+    a { text-decoration: none; color: inherit; }
+    .container { max-width: 1000px; margin: 0 auto; }
+    .header-main { border-bottom: 1px solid #333; padding-bottom: 15px; margin-bottom: 20px; }
+    h1 { color: var(--p); margin: 0; font-size: 24px; }
+    
+    .filter-bar { background: var(--b2); border: 1px solid #333; border-radius: 8px; padding: 16px; margin-bottom: 24px; display: flex; flex-wrap: wrap; gap: 12px; align-items: center; }
+    .search-box { flex: 1; min-width: 200px; position: relative; }
+    .search-box input { width: 100%; padding: 10px 14px 10px 38px; border: 1px solid #444; border-radius: 6px; background: var(--b3); color: #fff; font-size: 14px; box-sizing: border-box; }
+    .search-box input:focus { outline: none; border-color: var(--p); }
+    .search-box input::placeholder { color: #666; }
+    .search-icon { position: absolute; left: 12px; top: 50%; transform: translateY(-50%); width: 16px; height: 16px; color: #666; }
+    .filter-select { padding: 10px 12px; border: 1px solid #444; border-radius: 6px; background: var(--b3); color: #fff; font-size: 14px; font-family: inherit; cursor: pointer; min-width: 120px; }
+    .filter-select:focus { outline: none; border-color: var(--p); }
+    .filter-select option { background: var(--b2); }
+    .clear-btn { padding: 10px 16px; border: 1px solid #555; border-radius: 6px; background: transparent; color: #aaa; font-size: 14px; font-family: inherit; cursor: pointer; transition: all 0.2s; }
+    .clear-btn:hover { border-color: var(--er); color: var(--er); }
+    .results-count { font-size: 14px; color: #888; padding: 8px 0; }
+    .items-container { background: var(--b2); border: 1px solid #333; border-radius: 8px; overflow: hidden; }
+    .item { display: flex; padding: 12px; border-bottom: 1px solid #2a2a2a; transition: background 0.2s; }
+    .item.hidden { display: none; }
+    .item:last-child { border-bottom: none; }
+    .item:hover { background: var(--b3); }
+    .cover-box { width: 90px; flex-shrink: 0; margin-right: 15px; position: relative; border-radius: 4px; overflow: hidden; background: #000; aspect-ratio: 2/3; }
+    .cover-img { width: 100%; height: 100%; object-fit: cover; }
+    .details { flex-grow: 1; display: flex; flex-direction: column; justify-content: flex-start; overflow: hidden; }
+    .comic-title { font-weight: bold; font-size: 16px; color: #fff; margin-bottom: 4px; display: block; }
+    .stats-row { display: flex; align-items: center; gap: 12px; font-size: 14px; color: #aaa; margin-bottom: 6px; }
+    .star-val { color: var(--wa); font-weight: bold; }
+    .status-ongoing { color: var(--su); }
+    .status-completed { color: #60a5fa; }
+    .meta-row { font-size: 13px; line-height: 1.5; margin-bottom: 6px; color: #999; }
+    .tags-row { display: flex; flex-wrap: wrap; font-size: 12px; color: rgba(255,255,255,0.7); margin-bottom: 8px; line-height: 1.6; }
+    .tag { margin-right: 2px; }
+    .tag::after { content: ','; }
+    .tag:last-child::after { content: ''; }
+    .tag-bold { font-weight: bold; }
+    .tag-warning { font-weight: bold; border-bottom: 1px solid var(--wa); }
+    .tag-primary { font-weight: bold; border-bottom: 1px solid var(--p); }
+    .chapter-row { margin-top: auto; font-size: 14px; border-top: 1px dashed #333; padding-top: 8px; display: grid; grid-template-columns: 1fr 1fr; gap: 12px; }
+    .chap-info { display: flex; flex-direction: column; gap: 2px; }
+    .chap-label { font-size: 11px; color: #666; text-transform: uppercase; font-weight: 600; letter-spacing: 0.5px; }
+    .chap-val { color: var(--p); font-weight: 600; }
+    .chap-date { color: #666; font-size: 12px; }
+    .history-box { color: var(--wa); }
+    .no-results { text-align: center; padding: 40px; color: #666; font-size: 16px; }
+    
+    @media (max-width: 600px) {
+        .filter-bar { flex-direction: column; }
+        .search-box { width: 100%; }
+        .filter-select { width: 100%; }
+    }
+</style>
+</head>
+<body>
+<div class="container">
+    <div class="header-main">
+        <h1>${username}'s Reading History</h1>
+        <div style="color:#777; font-size:12px">Exported: ${date} | ${items.length} entries</div>
+    </div>
+    
+    <div class="filter-bar">
+        <div class="search-box">
+            <svg class="search-icon" viewBox="0 0 512 512" fill="currentColor"><path d="M416 208c0 45.9-14.9 88.3-40 122.7L502.6 457.4c12.5 12.5 12.5 32.8 0 45.3s-32.8 12.5-45.3 0L330.7 376c-34.4 25.2-76.8 40-122.7 40C93.1 416 0 322.9 0 208S93.1 0 208 0S416 93.1 416 208zM208 352a144 144 0 1 0 0-288 144 144 0 1 0 0 288z"/></svg>
+            <input type="text" id="searchInput" placeholder="Search by title or author...">
+        </div>
+        <select class="filter-select" id="statusFilter">
+            <option value="">All Status</option>
+            ${[...allStatuses].sort().map(s => '<option value="' + s + '">' + s + '</option>').join('')}
+        </select>
+        <select class="filter-select" id="langFilter">
+            <option value="">All Types</option>
+            ${langOptions}
+        </select>
+        <select class="filter-select" id="tagFilter">
+            <option value="">All Tags</option>
+            ${tagOptions}
+        </select>
+        <select class="filter-select" id="sortBy">
+            <option value="">Recently Read</option>
+            <option value="title">Title A-Z</option>
+            <option value="title-desc">Title Z-A</option>
+            <option value="score">Highest Score</option>
+            <option value="chapters">Most Chapters</option>
+        </select>
+        <button class="clear-btn" id="clearFilters">Clear</button>
+    </div>
+    <div class="results-count" id="resultsCount"></div>
+    <div class="items-container">`;
+
+        items.forEach(item => {
+            const score = item.score_avg ? item.score_avg.toFixed(1) : '-';
+            const status = item.uploadStatus || item.originalStatus || 'Unknown';
+            const statusClass = status.toLowerCase() === 'completed' ? 'status-completed' : 'status-ongoing';
+            const latestChap = item.chaps_normal ? `Ch.${item.chaps_normal}` : 'Unknown';
+            const authors = (item.authors || []).join(', ');
+            const escapedTitle = (item.name || '').replace(/"/g, '&quot;').toLowerCase();
+            const escapedAuthors = authors.replace(/"/g, '&quot;').toLowerCase();
+            
+            const warningTags = ['adult', 'mature', 'smut', 'gore', 'sexual violence', 'hentai'];
+            const demographicTags = ['josei', 'josei(w)', 'seinen', 'shoujo', 'shounen', 'kodomo'];
+            const langName = { 'ko': 'Manhwa', 'ja': 'Manga', 'zh': 'Manhua', 'en': 'Comic' };
+            
+            let tagsHtml = '';
+            if (item.origLang && langName[item.origLang]) {
+                tagsHtml += `<span class="tag tag-bold">${langName[item.origLang]}</span>`;
+            }
+            (item.genres || []).forEach(g => {
+                const gLower = g.toLowerCase();
+                let tagClass = 'tag';
+                if (warningTags.includes(gLower)) tagClass = 'tag tag-warning';
+                else if (demographicTags.includes(gLower)) tagClass = 'tag tag-primary';
+                tagsHtml += `<span class="${tagClass}">${g}</span>`;
+            });
+
+            const imgSrc = item.base64Cover;
+            const coverHtml = imgSrc ? `<div class="cover-box"><img class="cover-img" src="${imgSrc}" loading="lazy"></div>` : '';
+
+            const tagsLower = (item.genres || []).map(g => g.toLowerCase()).join(',');
+            const scoreNum = item.score_avg || 0;
+            const chaptersNum = item.chaps_normal || 0;
+
+            html += `<div class="item" data-title="${escapedTitle}" data-authors="${escapedAuthors}" data-status="${status}" data-lang="${item.origLang || ''}" data-tags="${tagsLower}" data-score="${scoreNum}" data-chapters="${chaptersNum}" data-lastread="${item.readDate || 0}">${coverHtml}<div class="details"><div class="comic-title">${item.name}</div><div class="stats-row"><span>&#9733; <span class="star-val">${score}</span></span><span class="${statusClass}">${status}</span></div><div class="meta-row"><span>${authors}</span></div><div class="tags-row">${tagsHtml}</div><div class="chapter-row"><div class="chap-info history-box"><span class="chap-label">Last Read</span><span class="chap-val" style="color:#facc15">${item.lastReadChapter || '-'}</span><span class="chap-date">${timeAgo(item.readDate)}</span></div><div class="chap-info"><span class="chap-label">Latest Chapter</span><span class="chap-val">${latestChap}</span></div></div></div></div>`;
+        });
+        
+        html += `</div>
+    <div class="no-results" id="noResults" style="display:none;">No comics match your filters</div>
+</div>
+<script>
+(function() {
+    var searchInput = document.getElementById('searchInput');
+    var statusFilter = document.getElementById('statusFilter');
+    var langFilter = document.getElementById('langFilter');
+    var tagFilter = document.getElementById('tagFilter');
+    var sortBy = document.getElementById('sortBy');
+    var clearBtn = document.getElementById('clearFilters');
+    var resultsCount = document.getElementById('resultsCount');
+    var noResults = document.getElementById('noResults');
+    
+    function applyFilters() {
+        var search = searchInput.value.toLowerCase().trim();
+        var statusVal = statusFilter.value;
+        var langVal = langFilter.value;
+        var tagVal = tagFilter.value.toLowerCase();
+        var sortVal = sortBy.value;
+        
+        var items = Array.from(document.querySelectorAll('.item'));
+        var totalVisible = 0;
+        
+        if (sortVal) {
+            items.sort(function(a, b) {
+                switch(sortVal) {
+                    case 'title': return a.dataset.title.localeCompare(b.dataset.title);
+                    case 'title-desc': return b.dataset.title.localeCompare(a.dataset.title);
+                    case 'score': return parseFloat(b.dataset.score || 0) - parseFloat(a.dataset.score || 0);
+                    case 'chapters': return parseInt(b.dataset.chapters || 0) - parseInt(a.dataset.chapters || 0);
+                    default: return parseInt(b.dataset.lastread || 0) - parseInt(a.dataset.lastread || 0);
+                }
+            });
+            var parent = items[0] ? items[0].parentNode : null;
+            if (parent) { items.forEach(function(item) { parent.appendChild(item); }); }
         }
+        
+        items.forEach(function(item) {
+            var title = item.dataset.title;
+            var authors = item.dataset.authors;
+            var status = item.dataset.status;
+            var lang = item.dataset.lang;
+            var tags = item.dataset.tags || '';
+            
+            var searchMatch = !search || title.indexOf(search) !== -1 || authors.indexOf(search) !== -1;
+            var statusMatch = !statusVal || status === statusVal;
+            var langMatch = !langVal || lang === langVal;
+            var tagMatch = !tagVal || tags.indexOf(tagVal) !== -1;
+            
+            if (searchMatch && statusMatch && langMatch && tagMatch) {
+                item.classList.remove('hidden');
+                totalVisible++;
+            } else {
+                item.classList.add('hidden');
+            }
+        });
+        
+        var hasFilters = search || statusVal || langVal || tagVal;
+        resultsCount.textContent = hasFilters ? totalVisible + ' comic' + (totalVisible !== 1 ? 's' : '') + ' found' : '';
+        noResults.style.display = totalVisible === 0 ? 'block' : 'none';
+    }
+    
+    searchInput.addEventListener('input', applyFilters);
+    statusFilter.addEventListener('change', applyFilters);
+    langFilter.addEventListener('change', applyFilters);
+    tagFilter.addEventListener('change', applyFilters);
+    sortBy.addEventListener('change', applyFilters);
+    
+    clearBtn.addEventListener('click', function() {
+        searchInput.value = '';
+        statusFilter.value = '';
+        langFilter.value = '';
+        tagFilter.value = '';
+        sortBy.value = '';
+        applyFilters();
     });
 })();
 </script>
-` : ''}
 </body></html>`;
         return html;
     }
 
+
     // --- FORMAT 2: PDF Generation using jsPDF ---
     async function generatePDF(lists, username, date, includeCovers = false) {
-        // Get jsPDF from globalThis (where it's available in extension context)
         const jsPDF = globalThis.jspdf?.jsPDF;
         if (!jsPDF) {
             throw new Error('jsPDF library not loaded. Please reload the extension.');
         }
         
         const doc = new jsPDF({ orientation: 'portrait', unit: 'mm', format: 'a4' });
-        
-        // Use custom font if available, otherwise fallback to helvetica
         const fontName = globalThis.BATO_PDF_FONT || 'helvetica';
         doc.setFont(fontName, 'normal');
         
@@ -948,21 +1331,14 @@ ${editable ? `
         const contentWidth = pageWidth - (margin * 2);
         let y = margin;
         
-        // Colors
         const C = {
             dark: [51, 51, 51],
             text: [68, 68, 68],
             muted: [136, 136, 136],
-            light: [200, 200, 200],
             border: [230, 230, 230],
-            headerBg: [245, 247, 250],
-            green: [34, 197, 94],
-            orange: [249, 115, 22],
-            red: [239, 68, 68],
-            blue: [59, 130, 246]
+            headerBg: [245, 247, 250]
         };
         
-        // Flatten all comics from all lists into one array with list info
         const allComics = [];
         let completedCount = 0;
         let ongoingCount = 0;
@@ -970,10 +1346,7 @@ ${editable ? `
         lists.forEach(list => {
             const items = list.data.comicNodes || [];
             items.forEach(node => {
-                allComics.push({
-                    ...node.data,
-                    listName: list.data.name
-                });
+                allComics.push({ ...node.data, listName: list.data.name });
                 const status = (node.data.uploadStatus || node.data.originalStatus || '').toLowerCase();
                 if (status === 'completed') completedCount++;
                 else ongoingCount++;
@@ -982,18 +1355,6 @@ ${editable ? `
         
         const totalCount = allComics.length;
         
-        // Truncate text helper
-        function truncate(text, maxWidth, fontSize) {
-            if (!text) return '';
-            doc.setFontSize(fontSize);
-            if (doc.getTextWidth(text) <= maxWidth) return text;
-            while (doc.getTextWidth(text + '...') > maxWidth && text.length > 0) {
-                text = text.slice(0, -1);
-            }
-            return text.length > 0 ? text + '...' : '';
-        }
-        
-        // Check page break
         function checkPage(needed = 15) {
             if (y + needed > pageHeight - 15) {
                 doc.addPage();
@@ -1003,14 +1364,12 @@ ${editable ? `
             return false;
         }
         
-        // ============ HEADER ============
-        // Title
+        // Header
         doc.setFontSize(24);
         doc.setFont(fontName, 'bold');
         doc.setTextColor(...C.dark);
         doc.text(`${SITE_CONFIG.name} List Export`, pageWidth / 2, y + 5, { align: 'center' });
         
-        // Username and date
         y += 14;
         doc.setFontSize(11);
         doc.setFont(fontName, 'normal');
@@ -1022,13 +1381,11 @@ ${editable ? `
         doc.setTextColor(...C.muted);
         doc.text(`Exported: ${date}`, pageWidth / 2, y, { align: 'center' });
         
-        // Divider line
         y += 8;
         doc.setDrawColor(...C.border);
         doc.setLineWidth(0.5);
         doc.line(margin + 20, y, pageWidth - margin - 20, y);
         
-        // Stats row
         y += 10;
         doc.setFontSize(10);
         doc.setTextColor(...C.text);
@@ -1037,14 +1394,11 @@ ${editable ? `
         
         y += 12;
         
-        // ============ TABLE HEADER ============
         const baseRowHeight = includeCovers ? 18 : 12;
         const coverWidth = includeCovers ? 12 : 0;
         const coverColWidth = includeCovers ? 15 : 0;
-        const lineHeight = 4; // Line height for wrapped text
+        const lineHeight = 4;
         
-        // Simplified columns: #, Cover (optional), Title, Progress, Tags
-        // A4 width = 210mm, margins = 15mm each side, content = 180mm
         const col = {
             num: margin,
             cover: margin + 10,
@@ -1053,15 +1407,12 @@ ${editable ? `
             tags: margin + (includeCovers ? 140 : 150)
         };
         
-        // Calculate max widths for text wrapping
         const titleMaxWidth = col.progress - col.title - 5;
         const tagsMaxWidth = pageWidth - margin - col.tags - 2;
         
-        // Header background
         doc.setFillColor(...C.headerBg);
         doc.rect(margin, y - 4, contentWidth, 10, 'F');
         
-        // Header text
         doc.setFontSize(8);
         doc.setFont(fontName, 'bold');
         doc.setTextColor(...C.muted);
@@ -1073,16 +1424,13 @@ ${editable ? `
         
         y += 10;
         
-        // Header bottom border
         doc.setDrawColor(...C.border);
         doc.setLineWidth(0.3);
         doc.line(margin, y - 2, pageWidth - margin, y - 2);
         
-        // ============ TABLE ROWS ============
         for (let i = 0; i < allComics.length; i++) {
             const c = allComics[i];
             
-            // Calculate wrapped text for title and tags
             doc.setFontSize(10);
             doc.setFont(fontName, 'bold');
             const titleLines = doc.splitTextToSize(c.name || '', titleMaxWidth);
@@ -1092,25 +1440,21 @@ ${editable ? `
             const genres = (c.genres || []).join(', ');
             const tagLines = doc.splitTextToSize(genres, tagsMaxWidth);
             
-            // Calculate row height based on wrapped text
             const titleHeight = titleLines.length * lineHeight;
             const tagHeight = tagLines.length * lineHeight;
             const textHeight = Math.max(titleHeight, tagHeight, baseRowHeight);
             const rowHeight = Math.max(textHeight + 4, baseRowHeight);
             
-            // Check if we need a new page
             checkPage(rowHeight + 2);
             
             const rowY = y;
             const textStartY = rowY + 3;
             
-            // Row number
             doc.setFontSize(9);
             doc.setFont(fontName, 'normal');
             doc.setTextColor(...C.muted);
             doc.text(String(i + 1), col.num + 2, textStartY);
             
-            // Cover image (if enabled)
             if (includeCovers) {
                 doc.setFillColor(240, 240, 240);
                 doc.setDrawColor(...C.border);
@@ -1119,13 +1463,10 @@ ${editable ? `
                 if (c.base64Cover) {
                     try {
                         doc.addImage(c.base64Cover, 'JPEG', col.cover, rowY - 1, coverWidth, Math.min(rowHeight - 2, 16));
-                    } catch (e) {
-                        // Keep placeholder if image fails
-                    }
+                    } catch (e) {}
                 }
             }
             
-            // Title (bold, wrapped)
             doc.setFontSize(10);
             doc.setFont(fontName, 'bold');
             doc.setTextColor(...C.dark);
@@ -1133,7 +1474,6 @@ ${editable ? `
                 doc.text(line, col.title, textStartY + (idx * lineHeight));
             });
             
-            // Progress (last read / total)
             doc.setFontSize(9);
             doc.setFont(fontName, 'normal');
             doc.setTextColor(...C.text);
@@ -1151,7 +1491,6 @@ ${editable ? `
             }
             doc.text(progressText, col.progress, textStartY);
             
-            // Tags/Genres (wrapped)
             doc.setFontSize(8);
             doc.setTextColor(...C.muted);
             tagLines.forEach((line, idx) => {
@@ -1160,13 +1499,185 @@ ${editable ? `
             
             y += rowHeight;
             
-            // Row separator
             doc.setDrawColor(...C.border);
             doc.setLineWidth(0.1);
             doc.line(margin, y - 2, pageWidth - margin, y - 2);
         }
         
-        // ============ FOOTER on each page ============
+        const totalPages = doc.internal.getNumberOfPages();
+        for (let i = 1; i <= totalPages; i++) {
+            doc.setPage(i);
+            doc.setFontSize(8);
+            doc.setTextColor(...C.muted);
+            doc.text(`Page ${i} of ${totalPages}`, pageWidth / 2, pageHeight - 8, { align: 'center' });
+        }
+        
+        return doc.output('blob');
+    }
+
+    // --- HISTORY PDF GENERATOR ---
+    async function generateHistoryPDF(items, username, date, includeCovers = false) {
+        const jsPDF = globalThis.jspdf?.jsPDF;
+        if (!jsPDF) {
+            throw new Error('jsPDF library not loaded. Please reload the extension.');
+        }
+        
+        const doc = new jsPDF({ orientation: 'portrait', unit: 'mm', format: 'a4' });
+        const fontName = globalThis.BATO_PDF_FONT || 'helvetica';
+        doc.setFont(fontName, 'normal');
+        
+        const pageWidth = doc.internal.pageSize.getWidth();
+        const pageHeight = doc.internal.pageSize.getHeight();
+        const margin = 15;
+        const contentWidth = pageWidth - (margin * 2);
+        let y = margin;
+        
+        const C = {
+            dark: [51, 51, 51],
+            text: [68, 68, 68],
+            muted: [136, 136, 136],
+            border: [230, 230, 230],
+            headerBg: [245, 247, 250]
+        };
+        
+        function checkPage(needed = 15) {
+            if (y + needed > pageHeight - 15) {
+                doc.addPage();
+                y = margin;
+                return true;
+            }
+            return false;
+        }
+        
+        // Header
+        doc.setFontSize(24);
+        doc.setFont(fontName, 'bold');
+        doc.setTextColor(...C.dark);
+        doc.text(`${SITE_CONFIG.name} Reading History`, pageWidth / 2, y + 5, { align: 'center' });
+        
+        y += 14;
+        doc.setFontSize(11);
+        doc.setFont(fontName, 'normal');
+        doc.setTextColor(...C.text);
+        doc.text(username, pageWidth / 2, y, { align: 'center' });
+        
+        y += 6;
+        doc.setFontSize(10);
+        doc.setTextColor(...C.muted);
+        doc.text(`Exported: ${date} | ${items.length} entries`, pageWidth / 2, y, { align: 'center' });
+        
+        y += 8;
+        doc.setDrawColor(...C.border);
+        doc.setLineWidth(0.5);
+        doc.line(margin + 20, y, pageWidth - margin - 20, y);
+        
+        y += 12;
+        
+        const baseRowHeight = includeCovers ? 18 : 12;
+        const coverWidth = includeCovers ? 12 : 0;
+        const coverColWidth = includeCovers ? 15 : 0;
+        const lineHeight = 4;
+        
+        const col = {
+            num: margin,
+            cover: margin + 10,
+            title: margin + 10 + coverColWidth,
+            lastRead: margin + (includeCovers ? 100 : 110),
+            tags: margin + (includeCovers ? 130 : 140)
+        };
+        
+        const titleMaxWidth = col.lastRead - col.title - 5;
+        const tagsMaxWidth = pageWidth - margin - col.tags - 2;
+        
+        doc.setFillColor(...C.headerBg);
+        doc.rect(margin, y - 4, contentWidth, 10, 'F');
+        
+        doc.setFontSize(8);
+        doc.setFont(fontName, 'bold');
+        doc.setTextColor(...C.muted);
+        
+        doc.text('#', col.num + 2, y + 2);
+        doc.text('Title', col.title, y + 2);
+        doc.text('Last Read', col.lastRead, y + 2);
+        doc.text('Tags', col.tags, y + 2);
+        
+        y += 10;
+        
+        doc.setDrawColor(...C.border);
+        doc.setLineWidth(0.3);
+        doc.line(margin, y - 2, pageWidth - margin, y - 2);
+        
+        for (let i = 0; i < items.length; i++) {
+            const item = items[i];
+            
+            doc.setFontSize(10);
+            doc.setFont(fontName, 'bold');
+            const titleLines = doc.splitTextToSize(item.name || '', titleMaxWidth);
+            
+            doc.setFontSize(8);
+            doc.setFont(fontName, 'normal');
+            const genres = (item.genres || []).join(', ');
+            const tagLines = doc.splitTextToSize(genres, tagsMaxWidth);
+            
+            const titleHeight = titleLines.length * lineHeight;
+            const tagHeight = tagLines.length * lineHeight;
+            const textHeight = Math.max(titleHeight, tagHeight, baseRowHeight);
+            const rowHeight = Math.max(textHeight + 4, baseRowHeight);
+            
+            checkPage(rowHeight + 2);
+            
+            const rowY = y;
+            const textStartY = rowY + 3;
+            
+            doc.setFontSize(9);
+            doc.setFont(fontName, 'normal');
+            doc.setTextColor(...C.muted);
+            doc.text(String(i + 1), col.num + 2, textStartY);
+            
+            if (includeCovers) {
+                doc.setFillColor(240, 240, 240);
+                doc.setDrawColor(...C.border);
+                doc.rect(col.cover, rowY - 1, coverWidth, Math.min(rowHeight - 2, 16), 'FD');
+                
+                if (item.base64Cover) {
+                    try {
+                        doc.addImage(item.base64Cover, 'JPEG', col.cover, rowY - 1, coverWidth, Math.min(rowHeight - 2, 16));
+                    } catch (e) {}
+                }
+            }
+            
+            doc.setFontSize(10);
+            doc.setFont(fontName, 'bold');
+            doc.setTextColor(...C.dark);
+            titleLines.forEach((line, idx) => {
+                doc.text(line, col.title, textStartY + (idx * lineHeight));
+            });
+            
+            doc.setFontSize(9);
+            doc.setFont(fontName, 'normal');
+            doc.setTextColor(...C.text);
+            const lastReadText = item.lastReadChapter || '-';
+            const readDateText = item.readDate ? timeAgo(item.readDate) : '';
+            doc.text(lastReadText, col.lastRead, textStartY);
+            if (readDateText) {
+                doc.setFontSize(7);
+                doc.setTextColor(...C.muted);
+                doc.text(readDateText, col.lastRead, textStartY + lineHeight);
+            }
+            
+            doc.setFontSize(8);
+            doc.setTextColor(...C.muted);
+            tagLines.forEach((line, idx) => {
+                doc.text(line, col.tags, textStartY + (idx * lineHeight));
+            });
+            
+            y += rowHeight;
+            
+            doc.setDrawColor(...C.border);
+            doc.setLineWidth(0.1);
+            doc.line(margin, y - 2, pageWidth - margin, y - 2);
+        }
+        
         const totalPages = doc.internal.getNumberOfPages();
         for (let i = 1; i <= totalPages; i++) {
             doc.setPage(i);
@@ -1211,9 +1722,33 @@ ${editable ? `
         return rows.map(r => r.join(',')).join('\n');
     }
 
+    // --- History CSV Generator ---
+    function generateHistoryCSV(items, date) {
+        const rows = [];
+        rows.push(['Comic Name', 'Type', 'Score', 'Status', 'Last Read Chapter', 'Read Date', 'Total Chapters', 'Genres', 'Authors', 'URL']);
+        
+        items.forEach(item => {
+            const safe = (s) => `"${(s||'').replace(/"/g, '""')}"`;
+            const readDate = item.readDate ? new Date(item.readDate).toISOString().slice(0,10) : '-';
+
+            rows.push([
+                safe(item.name),
+                formatLang(item.origLang),
+                item.score_avg || '-',
+                item.uploadStatus || item.originalStatus || '-',
+                safe(item.lastReadChapter || '-'),
+                readDate,
+                item.chaps_normal || '-',
+                safe((item.genres||[]).join(', ')),
+                safe((item.authors||[]).join(', ')),
+                SITE_CONFIG.baseUrl + item.urlPath
+            ]);
+        });
+        return rows.map(r => r.join(',')).join('\n');
+    }
+
     // --- JSON Generator ---
     function generateJSON(lists) {
-        // Export all raw data from the API without reduction
         return JSON.stringify(lists.map(l => ({
             id: l.id,
             data: {
@@ -1239,17 +1774,36 @@ ${editable ? `
         })), null, 2);
     }
 
+    // --- History JSON Generator ---
+    function generateHistoryJSON(items) {
+        return JSON.stringify(items.map(item => ({
+            id: item.id,
+            name: item.name,
+            urlPath: item.urlPath,
+            urlCover600: item.urlCover600,
+            genres: item.genres,
+            authors: item.authors,
+            score_avg: item.score_avg,
+            status: item.uploadStatus || item.originalStatus,
+            origLang: item.origLang,
+            chaps_normal: item.chaps_normal,
+            lastReadChapter: item.lastReadChapter,
+            readDate: item.readDate
+        })), null, 2);
+    }
+
     // --- UI MANAGER ---
     const UI = {
         modal: null,
         
-        create() {
+        create(isHistory = false) {
             if (document.getElementById('be-modal')) return;
+            const title = isHistory ? 'Export Reading History' : 'Export Options';
             const html = `
             <div class="be-modal-overlay" id="be-overlay">
                 <div class="be-modal" id="be-modal">
                     <div class="be-header">
-                        <h3 class="be-title">Export Options</h3>
+                        <h3 class="be-title">${title}</h3>
                         <button class="be-close" id="be-close">&times;</button>
                     </div>
                     <div class="be-option-group">
@@ -1272,13 +1826,13 @@ ${editable ? `
                                 <div style="font-size: 11px; color: #888; margin-left: 24px; margin-top: 2px; margin-bottom: 10px;">
                                     Makes file fully offline but significantly larger (slower export).
                                 </div>
-                                <label style="display: flex; align-items: center; cursor: pointer;">
+                                ${!isHistory ? `<label style="display: flex; align-items: center; cursor: pointer;">
                                     <input type="checkbox" id="opt-editable" style="width: 14px; height: 14px; margin-top: 0; margin-right: 10px;">
                                     <span style="font-size: 13px; font-weight: bold; color: #ccc;">Editable Version</span>
                                 </label>
                                 <div style="font-size: 11px; color: #888; margin-left: 24px; margin-top: 2px;">
-                                    Add/edit/delete entries. Changes saved to browser localStorage.
-                                </div>
+                                    Add/edit/delete entries. Changes saved within the HTML file.
+                                </div>` : ''}
                             </div>
                         </div>
 
@@ -1286,7 +1840,7 @@ ${editable ? `
                             <input type="checkbox" id="fmt-pdf">
                             <div>
                                 <span class="be-label">PDF Document</span>
-                                <span class="be-desc">Professional formatted PDF with table of contents.</span>
+                                <span class="be-desc">Professional formatted PDF with table layout.</span>
                             </div>
                         </label>
                         
@@ -1315,13 +1869,12 @@ ${editable ? `
                     </div>
                 </div>
             </div>`;
-            const div = document.createElement('div');
-            div.innerHTML = html;
-            document.body.appendChild(div.firstElementChild);
+            const parser = new DOMParser();
+            const doc = parser.parseFromString(html, 'text/html');
+            document.body.appendChild(doc.body.firstElementChild);
 
             this.modal = document.getElementById('be-overlay');
             
-            // Interaction Logic for Sub-option (HTML covers)
             const htmlCheck = document.getElementById('fmt-html');
             const coversCheck = document.getElementById('opt-covers');
             const editableCheck = document.getElementById('opt-editable');
@@ -1330,12 +1883,12 @@ ${editable ? `
             const toggleCovers = () => {
                 if (htmlCheck.checked) {
                     coversCheck.disabled = false;
-                    editableCheck.disabled = false;
+                    if (editableCheck) editableCheck.disabled = false;
                     subContainer.style.opacity = '1';
                     subContainer.style.pointerEvents = 'auto';
                 } else {
                     coversCheck.disabled = true;
-                    editableCheck.disabled = true;
+                    if (editableCheck) editableCheck.disabled = true;
                     subContainer.style.opacity = '0.4';
                     subContainer.style.pointerEvents = 'none';
                 }
@@ -1343,7 +1896,6 @@ ${editable ? `
             htmlCheck.onchange = toggleCovers;
             toggleCovers();
             
-            // Interaction Logic for PDF covers option
             const pdfCheck = document.getElementById('fmt-pdf');
             const pdfCoversCheck = document.getElementById('opt-pdf-covers');
             const pdfOptContainer = document.getElementById('pdf-opt-container');
@@ -1361,11 +1913,20 @@ ${editable ? `
 
             document.getElementById('be-close').onclick = () => this.hide();
             document.getElementById('be-cancel').onclick = () => this.hide();
-            document.getElementById('be-start').onclick = () => logic.startExport();
+            document.getElementById('be-start').onclick = () => {
+                if (isHistory) {
+                    historyLogic.startExport();
+                } else {
+                    logic.startExport();
+                }
+            };
             this.modal.onclick = (e) => { if(e.target === this.modal) this.hide(); };
         },
-        show() { this.create(); this.modal.classList.add('open'); },
-        hide() { if(this.modal) this.modal.classList.remove('open'); },
+        show(isHistory = false) { 
+            this.create(isHistory); 
+            this.modal.classList.add('open'); 
+        },
+        hide() { if(this.modal) { this.modal.classList.remove('open'); this.modal.remove(); this.modal = null; } },
         updateStatus(msg) {
             const el = document.getElementById('be-progress');
             el.style.display = 'block';
@@ -1378,7 +1939,8 @@ ${editable ? `
         }
     };
 
-    // --- MAIN LOGIC ---
+
+    // --- MAIN LOGIC FOR LISTS ---
     const logic = {
         async startExport() {
             const userId = getUserId();
@@ -1387,7 +1949,8 @@ ${editable ? `
             const doCsv = document.getElementById('fmt-csv').checked;
             const doJson = document.getElementById('fmt-json').checked;
             const embedCovers = document.getElementById('opt-covers').checked;
-            const editableHtml = document.getElementById('opt-editable').checked;
+            const editableCheck = document.getElementById('opt-editable');
+            const editableHtml = editableCheck ? editableCheck.checked : false;
             const pdfCovers = document.getElementById('opt-pdf-covers').checked;
 
             if (!doHtml && !doCsv && !doJson && !doPdf) return alert("Select a format.");
@@ -1417,7 +1980,6 @@ ${editable ? `
                     }
                 });
 
-                // Download covers if needed for HTML or PDF
                 if ((doHtml && embedCovers) || (doPdf && pdfCovers)) {
                     await processCoversWithQueue(lists, UI.updateStatus);
                 }
@@ -1509,7 +2071,119 @@ ${editable ? `
         }
     };
 
-    function init() {
+    // --- HISTORY PAGE LOGIC ---
+    const historyLogic = {
+        async startExport() {
+            const doHtml = document.getElementById('fmt-html').checked;
+            const doPdf = document.getElementById('fmt-pdf').checked;
+            const doCsv = document.getElementById('fmt-csv').checked;
+            const doJson = document.getElementById('fmt-json').checked;
+            const embedCovers = document.getElementById('opt-covers').checked;
+            const pdfCovers = document.getElementById('opt-pdf-covers').checked;
+
+            if (!doHtml && !doCsv && !doJson && !doPdf) return alert("Select a format.");
+
+            UI.setLoading(true);
+            UI.updateStatus(`Fetching reading history from ${SITE_CONFIG.name}...`);
+
+            try {
+                const items = await this.fetchFullHistory();
+                if (!items.length) {
+                    UI.updateStatus("No history found.");
+                    UI.setLoading(false);
+                    return;
+                }
+
+                if ((doHtml && embedCovers) || (doPdf && pdfCovers)) {
+                    await processHistoryCovers(items, UI.updateStatus);
+                }
+
+                UI.updateStatus("Generating files...");
+                const user = "My";
+                const date = new Date().toISOString().slice(0, 10);
+                const base = `${SITE_CONFIG.name.toLowerCase()}_history_${date}`;
+
+                if (doHtml) downloadFile(generateHistoryHTML(items, user, date), base+'.html', 'text/html');
+                if (doPdf) {
+                    UI.updateStatus("Generating PDF...");
+                    const pdfBlob = await generateHistoryPDF(items, user, date, pdfCovers);
+                    downloadFile(pdfBlob, base+'.pdf', 'application/pdf');
+                }
+                if (doCsv) downloadFile("\uFEFF"+generateHistoryCSV(items, date), base+'.csv', 'text/csv;charset=utf-8;');
+                if (doJson) downloadFile(generateHistoryJSON(items), base+'.json', 'application/json');
+
+                UI.updateStatus("Done! Check your downloads.");
+                UI.setLoading(false);
+            } catch (e) {
+                console.error(e);
+                UI.updateStatus("Error: " + e.message);
+                UI.setLoading(false);
+            }
+        },
+
+        async fetchFullHistory() {
+            const items = [];
+            const seenComicIds = new Set();
+            let startCursor = null;
+            let page = 1;
+            let hasMore = true;
+            const MAX_PAGES = 50;
+
+            while (hasMore && page <= MAX_PAGES) {
+                UI.updateStatus(`Fetching history page ${page}...`);
+                const res = await fetch(API_ENDPOINT, {
+                    method: 'POST',
+                    headers: {'Content-Type': 'application/json'},
+                    body: JSON.stringify({
+                        query: HISTORY_FULL_QUERY,
+                        variables: { select: { limit: HISTORY_EXPORT_LIMIT, start: startCursor } }
+                    })
+                });
+                const json = await res.json();
+                const data = cleanObject(json.data?.get_sser_myHistory);
+                
+                if (!data || !data.items || data.items.length === 0) break;
+
+                data.items.forEach(item => {
+                    const comic = item.comicNode?.data;
+                    const chapter = item.chapterNode?.data;
+                    if (comic && !seenComicIds.has(comic.id)) {
+                        seenComicIds.add(comic.id);
+                        
+                        // Get latest chapter info - handle both Bato and MangaPark field names
+                        const latestChapterNodes = comic.last_chapterNodes || comic.chapterNodes_last;
+                        const latestChapter = latestChapterNodes?.[0]?.data;
+                        
+                        items.push({
+                            id: comic.id,
+                            name: comic.name,
+                            urlPath: comic.urlPath,
+                            urlCover600: comic.urlCover600,
+                            genres: comic.genres,
+                            authors: comic.authors || comic.artists || [],
+                            score_avg: comic.score_avg,
+                            uploadStatus: comic.uploadStatus,
+                            originalStatus: comic.originalStatus,
+                            origLang: comic.origLang,
+                            chaps_normal: comic.chaps_normal,
+                            dateUpdate: comic.dateUpdate || comic.dateModify,
+                            lastReadChapter: chapter?.dname || chapter?.title || `Ch.${chapter?.serial}`,
+                            readDate: item.date,
+                            latestChapter: latestChapter?.dname || latestChapter?.title || null
+                        });
+                    }
+                });
+                
+                startCursor = data.newStart;
+                if (!startCursor) hasMore = false;
+                page++;
+            }
+            return items;
+        }
+    };
+
+    // --- INITIALIZATION ---
+    function initListPage() {
         if (document.getElementById('bato-csv-btn')) return;
         const likedBtn = document.querySelector(SITE_CONFIG.buttonSelector);
         if (!likedBtn || !likedBtn.parentElement) return;
@@ -1518,16 +2192,60 @@ ${editable ? `
         btn.id = 'bato-csv-btn';
         btn.className = 'btn btn-xs rounded btn-success ml-2 font-bold text-white';
         btn.innerText = 'Export';
-        btn.onclick = () => UI.show();
+        btn.onclick = () => UI.show(false);
         likedBtn.parentElement.appendChild(btn);
     }
 
-    // Run init, and retry a few times for SPAs that load content dynamically
+    function initHistoryPage() {
+        if (document.getElementById('history-export-btn')) return;
+        
+        // Look for the history page title "My History by Profile"
+        const pageTitle = document.querySelector('h2.text-sky-500');
+        if (pageTitle && pageTitle.textContent.includes('History')) {
+            const btn = document.createElement('button');
+            btn.id = 'history-export-btn';
+            btn.className = 'btn btn-xs rounded btn-success ml-3 font-bold text-white';
+            btn.innerText = 'Export';
+            btn.onclick = () => UI.show(true);
+            pageTitle.appendChild(btn);
+            return;
+        }
+        
+        // Fallback: look for any h2 element
+        const h2 = document.querySelector('main h2');
+        if (h2) {
+            const btn = document.createElement('button');
+            btn.id = 'history-export-btn';
+            btn.className = 'btn btn-xs rounded btn-success ml-3 font-bold text-white';
+            btn.innerText = 'Export';
+            btn.onclick = () => UI.show(true);
+            h2.appendChild(btn);
+            return;
+        }
+        
+        // Last fallback: floating button
+        const btn = document.createElement('button');
+        btn.id = 'history-export-btn';
+        btn.className = 'btn btn-success';
+        btn.style.cssText = 'position: fixed; top: 80px; right: 20px; z-index: 9999; padding: 10px 20px; font-weight: bold;';
+        btn.innerText = 'Export History';
+        btn.onclick = () => UI.show(true);
+        document.body.appendChild(btn);
+    }
+
     function tryInit(attempts = 0) {
-        if (document.getElementById('bato-csv-btn')) return;
-        init();
-        if (!document.getElementById('bato-csv-btn') && attempts < 10) {
-            setTimeout(() => tryInit(attempts + 1), 500);
+        if (isHistoryPage) {
+            if (document.getElementById('history-export-btn')) return;
+            initHistoryPage();
+            if (!document.getElementById('history-export-btn') && attempts < 10) {
+                setTimeout(() => tryInit(attempts + 1), 500);
+            }
+        } else if (isListPage) {
+            if (document.getElementById('bato-csv-btn')) return;
+            initListPage();
+            if (!document.getElementById('bato-csv-btn') && attempts < 10) {
+                setTimeout(() => tryInit(attempts + 1), 500);
+            }
         }
     }
 
