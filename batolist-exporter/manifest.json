@@ -1,0 +1,48 @@
+{
+  "manifest_version": 3,
+  "name": "BatoList Exporter",
+  "version": "1.4",
+  "description": "Export your Bato/MangaPark lists to CSV, HTML, JSON, or PDF.",
+  "permissions": [
+    "activeTab"
+  ],
+  "host_permissions": [
+    "https://bato.si/*",
+    "https://bato.to/*",
+    "https://bato.ing/*",
+    "https://mangapark.io/*",
+    "https://mangapark.net/*",
+    "https://mangapark.com/*"
+  ],
+  "browser_specific_settings": {
+    "gecko": {
+      "id": "batolist-exporter@raidenoq.com",
+      "data_collection_permissions": {
+        "required": ["none"]
+      }
+    }
+  },
+  "content_scripts": [
+    {
+      "matches": [
+        "https://bato.si/u/*/batolists*",
+        "https://bato.to/u/*/batolists*",
+        "https://bato.ing/u/*/batolists*"
+      ],
+      "js": ["jsPDF-3.0.4/dist/jspdf.umd.min.js", "Inter-normal.js", "Inter-bold.js", "fonts/inter.js", "exporter.js"],
+      "css": ["style.css"]
+    },
+    {
+      "matches": [
+        "https://mangapark.io/u/*/mplists",
+        "https://mangapark.io/u/*/mplists/*",
+        "https://mangapark.net/u/*/mplists",
+        "https://mangapark.net/u/*/mplists/*",
+        "https://mangapark.com/u/*/mplists",
+        "https://mangapark.com/u/*/mplists/*"
+      ],
+      "js": ["jsPDF-3.0.4/dist/jspdf.umd.min.js", "Inter-normal.js", "Inter-bold.js", "fonts/inter.js", "exporter.js"],
+      "css": ["style.css"]
+    }
+  ]
+}
